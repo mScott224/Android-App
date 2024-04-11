@@ -6,10 +6,11 @@ package com.windscribe.vpn.backend
 
 import com.windscribe.vpn.ServiceInteractor
 import com.windscribe.vpn.autoconnection.ProtocolInformation
-import com.windscribe.vpn.backend.wireguard.WireguardBackend
 import com.windscribe.vpn.constants.PreferencesKeyConstants
+import com.windscribe.vpn.repository.AdvanceParameterRepository
 import com.windscribe.vpn.state.NetworkInfoManager
 import com.windscribe.vpn.state.VPNConnectionStateManager
+import io.reactivex.Single
 import io.reactivex.disposables.CompositeDisposable
 import io.reactivex.schedulers.Schedulers
 import kotlinx.coroutines.CoroutineScope
@@ -28,10 +29,11 @@ import javax.inject.Singleton
  * */
 @Singleton
 abstract class VpnBackend(
-    private val mainScope: CoroutineScope,
-    val stateManager: VPNConnectionStateManager,
-    private val vpnServiceInteractor: ServiceInteractor,
-    private val networkInfoManager: NetworkInfoManager
+        private val mainScope: CoroutineScope,
+        val stateManager: VPNConnectionStateManager,
+        private val vpnServiceInteractor: ServiceInteractor,
+        private val networkInfoManager: NetworkInfoManager,
+        private val advanceParameterRepository: AdvanceParameterRepository
 ) {
 
     val vpnLogger: Logger = LoggerFactory.getLogger("vpn_backend")
@@ -57,18 +59,14 @@ abstract class VpnBackend(
     fun startConnectionJob() {
         val preferredProtocolOn = networkInfoManager.networkInfo?.isPreferredOn ?: false
         if (preferredProtocolOn.not() && vpnServiceInteractor.preferenceHelper.getResponseString(
-                PreferencesKeyConstants.CONNECTION_MODE_KEY
-            ) != PreferencesKeyConstants.CONNECTION_MODE_AUTO) {
+                        PreferencesKeyConstants.CONNECTION_MODE_KEY
+                ) != PreferencesKeyConstants.CONNECTION_MODE_AUTO) {
             vpnLogger.debug("Manual connection mode selected without preferred protocol.")
             return
         }
         connectionJob = mainScope.launch {
             vpnLogger.debug("Connection timer started.")
-            if (this@VpnBackend is WireguardBackend) {
-                delay(WG_CONNECTING_WAIT)
-            } else {
-                delay(CONNECTING_WAIT)
-            }
+            delay(CONNECTING_WAIT)
             connectionTimeout()
         }
     }
@@ -76,10 +74,10 @@ abstract class VpnBackend(
     private suspend fun connectionTimeout() {
         vpnLogger.debug("Connection timeout.")
         disconnect(
-            error = VPNState.Error(
-                error = VPNState.ErrorType.TimeoutError,
-                "connection timeout"
-            )
+                error = VPNState.Error(
+                        error = VPNState.ErrorType.TimeoutError,
+                        "connection timeout"
+                )
         )
     }
 
@@ -91,13 +89,27 @@ abstract class VpnBackend(
     fun testConnectivity() {
         connectionJob?.cancel()
         connectivityTestJob.clear()
-        vpnLogger.debug("Testing internet connectivity.")
+        vpnLogger.debug("Starting connectivity test.")
+        val startDelay = advanceParameterRepository.getTunnelStartDelay() ?: 500
+        val retryDelay = advanceParameterRepository.getTunnelTestRetryDelay() ?: 500
+        // Max Attempts = First attempt + retries
+        val maxAttempts = advanceParameterRepository.getTunnelTestAttempts() ?: 3
+        var maxRetries = maxAttempts
+        if (maxAttempts >= 1) {
+            maxRetries -= 1
+        }
+        var failedAttemptIndex = 0
         connectivityTestJob.add(
-            vpnServiceInteractor.apiManager
-                .getConnectedIp().delay(500, TimeUnit.MILLISECONDS)
-                        .retry(3)
-                        .timeout(20, TimeUnit.SECONDS)
-                        .delaySubscription(500, TimeUnit.MILLISECONDS)
+                Single.just(true).delay(startDelay, TimeUnit.MILLISECONDS).flatMap {
+                    vpnServiceInteractor.apiManager
+                            .getConnectedIp()
+                            .doOnError {
+                                failedAttemptIndex++
+                                vpnLogger.debug("Failed Attempt: $failedAttemptIndex")
+                            }.retryWhen { error ->
+                                return@retryWhen error.take(maxRetries).delay(retryDelay, TimeUnit.MILLISECONDS)
+                            }
+                }.timeout(20, TimeUnit.SECONDS)
                         .observeOn(Schedulers.io())
                         .subscribeOn(Schedulers.io())
                         .subscribe(
@@ -158,10 +170,10 @@ abstract class VpnBackend(
             mainScope.launch {
                 vpnLogger.debug("Connectivity test failed.")
                 disconnect(
-                    error = VPNState.Error(
-                        VPNState.ErrorType.ConnectivityTestFailed,
-                        "Connectivity test failed."
-                    )
+                        error = VPNState.Error(
+                                VPNState.ErrorType.ConnectivityTestFailed,
+                                "Connectivity test failed."
+                        )
                 )
             }
         } else {
